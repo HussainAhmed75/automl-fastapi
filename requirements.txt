@@ -1,9 +1,13 @@
 fastapi
 uvicorn
+python-multipart
 pandas
 numpy
 scikit-learn
 xgboost
 lightgbm
-shap
-python-multipart
+optuna
+category_encoders
+matplotlib
+seaborn
+openpyxl
