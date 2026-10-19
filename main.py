@@ -44,6 +44,7 @@ except:
 
 import optuna
 import os
+import re
 import tempfile
 import warnings
 
@@ -65,29 +66,60 @@ def to_python(obj):
 # ==================== UTILITY FUNCTIONS ====================
 
 def detect_task(y: pd.Series):
-    """Smart task detection"""
-    if y.dtype == "object":
-        return "classification"
-    if y.nunique() / len(y) < 0.05 or y.nunique() < 20:
-        return "classification"
-    return "regression"
+    """Decide classification vs regression and explain why.
 
-def process_dates(df: pd.DataFrame) -> pd.DataFrame:
+    Returns (task, reason). The old rule (nunique < 20 or nunique/len < 5%)
+    treated large numeric targets like prices as classification, so the rule
+    now looks at the values themselves.
+    """
+    if (pd.api.types.is_object_dtype(y) or pd.api.types.is_string_dtype(y)
+            or pd.api.types.is_bool_dtype(y) or isinstance(y.dtype, pd.CategoricalDtype)):
+        return "classification", f"target is categorical (dtype: {y.dtype})"
+    n_unique = int(y.nunique())
+    values = y.dropna().astype(float)
+    if not np.all(np.isclose(values % 1, 0)):
+        return "regression", "target has decimal values, so it is treated as continuous"
+    if n_unique <= 20:
+        return "classification", f"target has only {n_unique} distinct integer values (<= 20)"
+    return "regression", f"target has {n_unique} distinct integer values (> 20)"
+
+
+def looks_like_id(s: pd.Series, name: str) -> bool:
+    """A column is an ID only if every value is unique AND it behaves like an identifier.
+
+    Continuous columns (distance, coordinates, prices with decimals) are also unique
+    on every row, so uniqueness alone is not enough.
+    """
+    if s.nunique() != len(s):
+        return False
+    if pd.api.types.is_float_dtype(s):
+        return False
+    if pd.api.types.is_integer_dtype(s):
+        name_hint = re.search(r"(^id$|^id_|_id$|index|serial|^no$|number$)", name.lower())
+        steps = s.sort_values().diff().dropna()
+        sequential = len(steps) > 0 and (steps == 1).mean() > 0.95
+        return bool(name_hint) or bool(sequential)
+    return True  # unique text values: names, codes, emails...
+
+
+def process_dates(df: pd.DataFrame, decisions: list = None) -> pd.DataFrame:
     """Extract features from datetime columns"""
     df = df.copy()
     for col in df.columns:
-        if df[col].dtype == 'object':
+        if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
             try:
                 df[col] = pd.to_datetime(df[col], errors='raise')
             except:
                 continue
-        if np.issubdtype(df[col].dtype, np.datetime64):
+        if pd.api.types.is_datetime64_any_dtype(df[col]):
             df[f"{col}_year"] = df[col].dt.year
             df[f"{col}_month"] = df[col].dt.month
             df[f"{col}_day"] = df[col].dt.day
             df[f"{col}_weekday"] = df[col].dt.weekday
             df[f"{col}_hour"] = df[col].dt.hour if hasattr(df[col].dt, 'hour') else 0
             df.drop(columns=[col], inplace=True)
+            if decisions is not None:
+                decisions.append({"step": "dates", "decision": f"expanded '{col}' into year/month/day/weekday/hour", "reason": "column parsed as a date"})
     return df
 
 def advanced_data_profiling(df: pd.DataFrame, target: str):
@@ -134,43 +166,73 @@ def detect_outliers(df: pd.DataFrame, method='iqr'):
     
     return outliers
 
-def intelligent_data_cleaning(df: pd.DataFrame, target: str, remove_outliers=False):
-    """Smart data cleaning"""
+def intelligent_data_cleaning(df: pd.DataFrame, target: str, remove_outliers=False,
+                              decisions: list = None, keep_columns=None):
+    """Smart data cleaning. Every column it drops is written to `decisions` with the reason."""
     df = df.copy()
-    
+    decisions = decisions if decisions is not None else []
+    keep = set(keep_columns or [])
+    candidates = [c for c in df.columns if c != target and c not in keep]
+
+    def log(decision, reason):
+        decisions.append({"step": "cleaning", "decision": decision, "reason": reason})
+
     # Remove ID columns
-    id_cols = [c for c in df.columns if c != target and df[c].nunique() == len(df)]
+    id_cols = [c for c in candidates if looks_like_id(df[c], c)]
+    for c in id_cols:
+        log(f"dropped '{c}'", "every value is unique and it looks like an identifier")
     df = df.drop(columns=id_cols)
-    
+    candidates = [c for c in candidates if c not in id_cols]
+
     # Remove high null columns (>80%)
-    high_null_cols = [c for c in df.columns if c != target and df[c].isnull().sum() / len(df) > 0.8]
+    high_null_cols = [c for c in candidates if df[c].isnull().sum() / len(df) > 0.8]
+    for c in high_null_cols:
+        log(f"dropped '{c}'", f"{df[c].isnull().mean():.0%} of values are missing (> 80%)")
     df = df.drop(columns=high_null_cols)
-    
+    candidates = [c for c in candidates if c not in high_null_cols]
+
     # Remove constant columns
-    constant_cols = [c for c in df.columns if c != target and df[c].nunique() == 1]
+    constant_cols = [c for c in candidates if df[c].nunique() <= 1]
+    for c in constant_cols:
+        log(f"dropped '{c}'", "column has a single constant value")
     df = df.drop(columns=constant_cols)
-    
-    # Optionally remove outliers
+
+    if keep:
+        log(f"kept {sorted(keep)} without checks", "listed in keep_columns by the user")
+
+    # Outliers are never removed automatically: they can be data errors or the exact cases you care about (fraud, failures).
     if remove_outliers:
         numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
         if target in numeric_cols:
             numeric_cols.remove(target)
-        
+        before = len(df)
         for col in numeric_cols:
             Q1 = df[col].quantile(0.25)
             Q3 = df[col].quantile(0.75)
             IQR = Q3 - Q1
             df = df[~((df[col] < (Q1 - 1.5 * IQR)) | (df[col] > (Q3 + 1.5 * IQR)))]
-    
+        decisions.append({"step": "outliers", "decision": f"removed {before - len(df)} rows with IQR outliers",
+                          "reason": "remove_outliers=true was requested by the user"})
+    else:
+        decisions.append({"step": "outliers", "decision": "kept all rows",
+                          "reason": "outliers can be errors or important cases; set remove_outliers=true to drop them"})
+
     return df
 
-def create_preprocessor(X, task="classification"):
+def create_preprocessor(X, task="classification", decisions: list = None):
     """Enhanced preprocessing pipeline"""
-    num_features = X.select_dtypes(include=["int64", "float64"]).columns.tolist()
-    cat_features = X.select_dtypes(include=["object", "category"]).columns.tolist()
+    num_features = X.select_dtypes(include="number").columns.tolist()
+    cat_features = X.select_dtypes(include=["object", "category", "string", "bool"]).columns.tolist()
     
     low_card_cat = [c for c in cat_features if X[c].nunique() <= 10]
     high_card_cat = [c for c in cat_features if X[c].nunique() > 10]
+    if decisions is not None:
+        if num_features:
+            decisions.append({"step": "preprocessing", "decision": f"{len(num_features)} numeric columns: median imputation + RobustScaler", "reason": "RobustScaler is less sensitive to outliers"})
+        if low_card_cat:
+            decisions.append({"step": "preprocessing", "decision": f"One-Hot Encoding for {low_card_cat}", "reason": "10 categories or fewer"})
+        if high_card_cat:
+            decisions.append({"step": "preprocessing", "decision": f"Target Encoding for {high_card_cat}", "reason": "more than 10 categories"})
     
     transformers = []
     
@@ -258,6 +320,8 @@ async def automl(
     test_size: float = Form(0.2),
     use_nested_cv: bool = Form(True),
     remove_outliers: bool = Form(False),
+    task_type: str = Form("auto"),  # "auto", "classification" or "regression"
+    keep_columns: str = Form(""),  # comma-separated columns that must never be dropped
     n_trials: int = Form(30),
     response_format: str = Form("pdf")  # "pdf" or "json"
 ):
@@ -302,15 +366,29 @@ async def automl(
     y_raw = df[target].copy()
     X_raw = df.drop(columns=[target])
     
-    X = process_dates(X_raw)
-    X = intelligent_data_cleaning(pd.concat([X, y_raw], axis=1), target, remove_outliers)
+    decisions = []
+    keep_list = [c.strip() for c in keep_columns.split(",") if c.strip()]
+    X = process_dates(X_raw, decisions)
+    X = intelligent_data_cleaning(pd.concat([X, y_raw], axis=1), target, remove_outliers,
+                                  decisions=decisions, keep_columns=keep_list)
     y_raw = X[target]
     X = X.drop(columns=[target])
     
     # ==================== TASK DETECTION ====================
-    task = detect_task(y_raw)
+    task_type = (task_type or "auto").strip().lower()
+    if task_type in ("classification", "regression"):
+        task, task_reason = task_type, "set by the user (task_type)"
+    elif task_type == "auto":
+        task, task_reason = detect_task(y_raw)
+    else:
+        raise HTTPException(400, "task_type must be 'auto', 'classification' or 'regression'")
+    decisions.insert(0, {"step": "task", "decision": task, "reason": task_reason})
     
     if task == "classification":
+        rare = y_raw.value_counts()
+        if (rare < 2).any():
+            raise HTTPException(400, f"Classification needs at least 2 rows per class, but {int((rare < 2).sum())} classes have only 1 row. "
+                                     f"If '{target}' is a continuous value, use task_type=regression.")
         label_encoder = LabelEncoder()
         y = label_encoder.fit_transform(y_raw)
         class_mapping = {i: str(cls) for i, cls in enumerate(label_encoder.classes_)}
@@ -331,7 +409,7 @@ async def automl(
         stratify=y if task == "classification" else None
     )
     
-    preprocessor = create_preprocessor(X_train, task)
+    preprocessor = create_preprocessor(X_train, task, decisions)
     
     # ==================== MODEL COMPARISON (ALL MODELS) ====================
     print("🔍 Comparing 10+ models...")
@@ -707,6 +785,7 @@ async def automl(
         "outliers": outliers_info,
         "task": task,
         "target": target,
+        "decisions": decisions,
         "best_model": best_name,
         "best_params": final_params if final_params else {},
         "all_models_scores": model_scores,
@@ -790,6 +869,21 @@ async def automl(
                 pdf.savefig(fig, bbox_inches='tight')
                 plt.close(fig)
                 
+                # Page 2: Decisions log - what the system decided on its own and why
+                fig = plt.figure(figsize=(11, 8.5))
+                ax = fig.add_subplot(111)
+                ax.axis('off')
+                ax.text(0.5, 0.96, "Decisions Log", fontsize=20, ha='center', weight='bold')
+                ax.text(0.5, 0.92, "What the system decided automatically, and why (override with task_type / keep_columns / remove_outliers)",
+                        fontsize=9, ha='center', style='italic')
+                y_pos = 0.86
+                for d in decisions[:16]:
+                    ax.text(0.04, y_pos, f"[{d['step']}] {d['decision']}", fontsize=10, weight='bold')
+                    ax.text(0.06, y_pos - 0.022, f"reason: {d['reason']}", fontsize=8.5, color='dimgray')
+                    y_pos -= 0.052
+                pdf.savefig(fig, bbox_inches='tight')
+                plt.close(fig)
+                
                 # Add visualization pages
                 for plot_name, plot_base64 in plots.items():
                     if plot_base64:
@@ -834,6 +928,8 @@ async def root():
             "test_size": "Test set ratio (optional, default: 0.2)",
             "use_nested_cv": "Use nested CV for top models (optional, default: true)",
             "remove_outliers": "Remove outliers automatically (optional, default: false)",
+            "task_type": "'auto', 'classification' or 'regression' (optional, default: 'auto')",
+            "keep_columns": "Comma-separated columns that must never be dropped (optional)",
             "n_trials": "Optuna trials for hyperparameter tuning (optional, default: 30)",
             "response_format": "'pdf' or 'json' (optional, default: 'pdf')"
         }
