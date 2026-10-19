@@ -39,6 +39,8 @@ Then open `http://127.0.0.1:8000/docs` to try it from the browser.
 | `test_size` | `0.2` | Share of data kept for testing |
 | `use_nested_cv` | `true` | Use nested cross-validation |
 | `remove_outliers` | `false` | Remove outliers with the IQR rule |
+| `task_type` | `auto` | `auto`, `classification` or `regression` (override the automatic detection) |
+| `keep_columns` | empty | Comma-separated columns that must never be dropped |
 | `n_trials` | `30` | Number of Optuna tuning trials |
 | `response_format` | `pdf` | `pdf` or `json` |
 
@@ -52,6 +54,15 @@ curl -X POST "http://127.0.0.1:8000/automl" \
 ```
 
 I also exposed it through ngrok and connected it to n8n so it can run inside automated workflows.
+
+## Decisions log
+
+Every choice the system makes on its own is recorded with its reason: the detected task, each dropped column (ID, mostly empty, constant), whether outliers were removed, and the encoding used per column. It appears as `decisions` in the JSON response and on its own page in the PDF report.
+
+Rules worth knowing:
+- **Task detection:** text/boolean target → classification; decimal values → regression; integer target with 20 distinct values or fewer → classification, otherwise regression. Use `task_type` to override.
+- **ID columns:** a column is dropped as an ID only if every value is unique *and* it looks like an identifier (text, or integers that are sequential or named like `id`). Continuous columns such as distance or coordinates are kept. Use `keep_columns` to protect any column.
+- **Outliers:** never removed unless `remove_outliers=true`, because an outlier can be a data error or the exact case you care about (fraud, failures).
 
 ## Tech stack
 
